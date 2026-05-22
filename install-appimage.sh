@@ -112,6 +112,25 @@ sudo chmod 644 "$DESKTOP_TARGET"
 # ===== Cleanup =====
 rm -rf "$TMP_DIR"
 
+# ===== Update Desktop Database =====
+echo "==> Updating desktop database..."
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    sudo update-desktop-database /usr/share/applications
+fi
+
+# ===== Update Icon Cache =====
+echo "==> Updating icon cache..."
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
+# Refresh GNOME Shell (optional)
+if command -v gio >/dev/null 2>&1; then
+    gio set "$DESKTOP_TARGET" metadata::trusted true >/dev/null 2>&1 || true
+fi
+
 echo ""
 echo "✅ AppImage installed successfully!"
 echo "App: $APP_NAME"
