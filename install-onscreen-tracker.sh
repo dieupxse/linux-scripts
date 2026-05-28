@@ -43,7 +43,7 @@ mkdir -p "$DATA_DIR"
 mkdir -p "$SYSTEMD_DIR"
 
 # ==========================================
-# Main Daemon
+# Daemon
 # ==========================================
 
 cat > "$BIN_DIR/onscreen-daemon.sh" <<'EOF'
@@ -66,37 +66,31 @@ touch "$HISTORY_FILE"
 if [ ! -s "$STATE_FILE" ]; then
 
 cat > "$STATE_FILE" <<STATE
-START_TS=0
 ACCUMULATED=0
-RUNNING=0
+LAST_TS=0
 LAST_AC=1
 CYCLE_DATE=""
 START_BATTERY=0
-END_BATTERY=0
 STATE
 
 fi
 
 source "$STATE_FILE"
 
-START_TS=${START_TS:-0}
 ACCUMULATED=${ACCUMULATED:-0}
-RUNNING=${RUNNING:-0}
+LAST_TS=${LAST_TS:-0}
 LAST_AC=${LAST_AC:-1}
-START_BATTERY=${START_BATTERY:-0}
-END_BATTERY=${END_BATTERY:-0}
 CYCLE_DATE=${CYCLE_DATE:-""}
+START_BATTERY=${START_BATTERY:-0}
 
 save_state() {
 
 cat > "$STATE_FILE" <<STATE
-START_TS=$START_TS
 ACCUMULATED=$ACCUMULATED
-RUNNING=$RUNNING
+LAST_TS=$LAST_TS
 LAST_AC=$LAST_AC
 CYCLE_DATE="$CYCLE_DATE"
 START_BATTERY=$START_BATTERY
-END_BATTERY=$END_BATTERY
 STATE
 }
 
@@ -110,13 +104,9 @@ date '+%Y-%m-%d %H:%M:%S'
 
 # ==========================================
 # AC Detection
-# 1 = Plugged
-# 0 = Battery
 # ==========================================
 
 get_ac_status() {
-
-# Preferred detection
 
 for supply in /sys/class/power_supply/*; do
 
@@ -137,8 +127,6 @@ for supply in /sys/class/power_supply/*; do
     esac
 
 done
-
-# Fallback battery status
 
 for bat in /sys/class/power_supply/BAT*; do
 
@@ -166,7 +154,7 @@ echo 1
 }
 
 # ==========================================
-# Battery Percentage
+# Battery %
 # ==========================================
 
 get_battery_percent() {
@@ -184,95 +172,12 @@ echo 0
 }
 
 # ==========================================
-# Start Count
-# ==========================================
-
-start_count() {
-
-if [ "$RUNNING" -eq 0 ]; then
-
-    START_TS=$(now_ts)
-
-    RUNNING=1
-
-    if [ -z "$CYCLE_DATE" ]; then
-
-        CYCLE_DATE=$(format_date)
-
-        START_BATTERY=$(get_battery_percent)
-
-    fi
-
-    save_state
-fi
-}
-
-# ==========================================
-# Pause Count
-# ==========================================
-
-pause_count() {
-
-if [ "$RUNNING" -eq 1 ]; then
-
-    NOW=$(now_ts)
-
-    ACCUMULATED=$((ACCUMULATED + NOW - START_TS))
-
-    RUNNING=0
-
-    save_state
-fi
-}
-
-# ==========================================
-# Reset Cycle
-# ==========================================
-
-reset_cycle() {
-
-TOTAL="$ACCUMULATED"
-
-if [ "$RUNNING" -eq 1 ]; then
-
-    NOW=$(now_ts)
-
-    TOTAL=$((TOTAL + NOW - START_TS))
-fi
-
-END_BATTERY=$(get_battery_percent)
-
-if [ "$TOTAL" -gt 0 ]; then
-
-    echo "$CYCLE_DATE|$TOTAL|$START_BATTERY|$END_BATTERY" >> "$HISTORY_FILE"
-
-fi
-
-START_TS=0
-ACCUMULATED=0
-RUNNING=0
-CYCLE_DATE=""
-START_BATTERY=0
-END_BATTERY=0
-
-save_state
-}
-
-# ==========================================
-# Restore Correctly After Reboot
+# Restore State
 # ==========================================
 
 CURRENT_AC=$(get_ac_status)
 
-if [ "$CURRENT_AC" = "0" ]; then
-
-    if [ "$RUNNING" -eq 1 ]; then
-
-        START_TS=$(now_ts)
-
-    fi
-
-fi
+LAST_TS=$(now_ts)
 
 LAST_AC="$CURRENT_AC"
 
@@ -286,30 +191,49 @@ while true; do
 
 CURRENT_AC=$(get_ac_status)
 
-# Charger plugged
+NOW=$(now_ts)
+
+DELTA=$((NOW - LAST_TS))
+
+# Ignore suspend/reboot delta
+
+if [ "$DELTA" -gt 15 ]; then
+    DELTA=0
+fi
+
+# Plugged -> reset cycle
 
 if [ "$CURRENT_AC" = "1" ] && [ "$LAST_AC" = "0" ]; then
 
-    pause_count
+    END_BATTERY=$(get_battery_percent)
 
-    reset_cycle
+    if [ "$ACCUMULATED" -gt 0 ]; then
+
+        echo "$CYCLE_DATE|$ACCUMULATED|$START_BATTERY|$END_BATTERY" >> "$HISTORY_FILE"
+
+    fi
+
+    ACCUMULATED=0
+    CYCLE_DATE=""
+    START_BATTERY=0
 fi
 
-# Charger unplugged
-
-if [ "$CURRENT_AC" = "0" ] && [ "$LAST_AC" = "1" ]; then
-
-    start_count
-fi
-
-# Continue counting while on battery
+# Unplugged
 
 if [ "$CURRENT_AC" = "0" ]; then
-    start_count
-else
-    pause_count
+
+    if [ -z "$CYCLE_DATE" ]; then
+
+        CYCLE_DATE=$(format_date)
+
+        START_BATTERY=$(get_battery_percent)
+
+    fi
+
+    ACCUMULATED=$((ACCUMULATED + DELTA))
 fi
 
+LAST_TS="$NOW"
 LAST_AC="$CURRENT_AC"
 
 save_state
@@ -320,95 +244,6 @@ done
 EOF
 
 chmod +x "$BIN_DIR/onscreen-daemon.sh"
-
-# ==========================================
-# Sleep Hook
-# ==========================================
-
-mkdir -p "$HOME/.local/share/systemd/user-sleep"
-
-cat > "$HOME/.local/share/systemd/user-sleep/onscreen-sleep-hook.sh" <<'EOF'
-#!/usr/bin/env bash
-
-STATE_FILE="$HOME/.local/share/onscreen/state"
-
-[ -f "$STATE_FILE" ] || exit 0
-
-source "$STATE_FILE"
-
-START_TS=${START_TS:-0}
-ACCUMULATED=${ACCUMULATED:-0}
-RUNNING=${RUNNING:-0}
-LAST_AC=${LAST_AC:-1}
-START_BATTERY=${START_BATTERY:-0}
-END_BATTERY=${END_BATTERY:-0}
-CYCLE_DATE=${CYCLE_DATE:-""}
-
-save_state() {
-
-cat > "$STATE_FILE" <<STATE
-START_TS=$START_TS
-ACCUMULATED=$ACCUMULATED
-RUNNING=$RUNNING
-LAST_AC=$LAST_AC
-CYCLE_DATE="$CYCLE_DATE"
-START_BATTERY=$START_BATTERY
-END_BATTERY=$END_BATTERY
-STATE
-}
-
-case "$1" in
-
-    pre)
-
-        if [ "$RUNNING" -eq 1 ]; then
-
-            NOW=$(date +%s)
-
-            ACCUMULATED=$((ACCUMULATED + NOW - START_TS))
-
-            RUNNING=0
-
-            save_state
-        fi
-        ;;
-
-    post)
-
-        AC=1
-
-        for supply in /sys/class/power_supply/*; do
-
-            TYPE=$(cat "$supply/type" 2>/dev/null)
-
-            case "$TYPE" in
-
-                Mains|USB|USB_C|USB_PD)
-
-                    if [ -f "$supply/online" ]; then
-                        AC=$(cat "$supply/online")
-                        break
-                    fi
-                    ;;
-
-            esac
-
-        done
-
-        if [ "$AC" = "0" ]; then
-
-            START_TS=$(date +%s)
-
-            RUNNING=1
-
-            save_state
-        fi
-        ;;
-
-esac
-EOF
-
-chmod +x "$HOME/.local/share/systemd/user-sleep/onscreen-sleep-hook.sh"
 
 # ==========================================
 # CLI
@@ -429,11 +264,11 @@ fi
 
 source "$STATE_FILE"
 
-START_TS=${START_TS:-0}
 ACCUMULATED=${ACCUMULATED:-0}
-RUNNING=${RUNNING:-0}
-START_BATTERY=${START_BATTERY:-0}
+LAST_TS=${LAST_TS:-0}
+LAST_AC=${LAST_AC:-1}
 CYCLE_DATE=${CYCLE_DATE:-""}
+START_BATTERY=${START_BATTERY:-0}
 
 format_time() {
 
@@ -444,20 +279,6 @@ M=$(((SECONDS % 3600) / 60))
 S=$((SECONDS % 60))
 
 printf "%02dh %02dm %02ds" "$H" "$M" "$S"
-}
-
-current_total() {
-
-TOTAL=$ACCUMULATED
-
-if [ "$RUNNING" -eq 1 ]; then
-
-    NOW=$(date +%s)
-
-    TOTAL=$((TOTAL + NOW - START_TS))
-fi
-
-echo "$TOTAL"
 }
 
 get_current_battery() {
@@ -476,7 +297,7 @@ echo 0
 
 show_current() {
 
-TOTAL=$(current_total)
+TOTAL=$ACCUMULATED
 
 DATE_SHOW="$CYCLE_DATE"
 
@@ -557,7 +378,7 @@ EOF
 chmod +x "$BIN_DIR/onscreen"
 
 # ==========================================
-# Main Service
+# Service
 # ==========================================
 
 cat > "$SYSTEMD_DIR/onscreen.service" <<EOF
@@ -571,25 +392,6 @@ RestartSec=3
 
 [Install]
 WantedBy=default.target
-EOF
-
-# ==========================================
-# Sleep Service
-# ==========================================
-
-cat > "$SYSTEMD_DIR/onscreen-sleep.service" <<EOF
-[Unit]
-Description=Onscreen Sleep Hook
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/share/systemd/user-sleep/onscreen-sleep-hook.sh pre
-ExecStop=%h/.local/share/systemd/user-sleep/onscreen-sleep-hook.sh post
-RemainAfterExit=yes
-
-[Install]
-WantedBy=suspend.target
-WantedBy=hibernate.target
 EOF
 
 # ==========================================
@@ -607,13 +409,12 @@ fi
 rm -f "$DATA_DIR/state"
 
 # ==========================================
-# Enable Services
+# Enable Service
 # ==========================================
 
 systemctl --user daemon-reload
 
 systemctl --user enable --now onscreen.service
-systemctl --user enable onscreen-sleep.service
 
 echo
 echo "========================================"
