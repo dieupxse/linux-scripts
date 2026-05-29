@@ -13,6 +13,8 @@ Kho lưu trữ này cung cấp bộ công cụ Shell Script (`.sh`) giúp tự �
 | **Giám sát Màn hình** | `install-onscreen-tracker.sh`<br>`uninstall-onscreen-tracker.sh` | `user` | `$HOME/.local/share/onscreen/` |
 | **Tích hợp Zalo** | `install-zalo.sh`<br>`remove-zalo.sh` | `sudo` | `/opt/zalo/`, `Desktop Shortcuts` |
 | **Chẩn đoán Hệ thống** | `system-report.sh` | `user` / `sudo` | Tối ưu Kernel, Boot-time, Log UI |
+| **Tối ưu & Khôi phục Ubuntu** | `ubuntu-debloat.sh`<br>`ubuntu-restore.sh` | `sudo` | Gỡ bỏ/trả lại package và dịch vụ Canonical |
+| **Tài liệu Tham khảo** | `Ubuntu-Optimize-On-Thinkpad.xlsx` | `user` | Hướng dẫn tối ưu Ubuntu cho ThinkPad |
 
 ---
 
@@ -81,6 +83,18 @@ Kiểm tra sức khỏe hệ thống: Phân tích xung đột các daemon nguồ
 * **Sử dụng:**
   ```bash
   ./system-report.sh
+  ```
+
+### 6. Tối ưu & Khôi phục Ubuntu (`ubuntu-debloat.sh`, `ubuntu-restore.sh`)
+Loại bỏ các package và dịch vụ Canonical không cần thiết, rồi khôi phục cấu hình gốc khi cần.
+
+* **Tối ưu hệ thống:**
+  ```bash
+  sudo ./ubuntu-debloat.sh
+  ```
+* **Khôi phục lại:**
+  ```bash
+  sudo ./ubuntu-restore.sh
   ```
 
 ---
