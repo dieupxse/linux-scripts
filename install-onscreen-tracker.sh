@@ -50,12 +50,10 @@ cat > "$BIN_DIR/onscreen-daemon.sh" <<'EOF'
 #!/usr/bin/env bash
 
 STATE_DIR="$HOME/.local/share/onscreen"
-
 STATE_FILE="$STATE_DIR/state"
 HISTORY_FILE="$STATE_DIR/history"
 
 mkdir -p "$STATE_DIR"
-
 touch "$STATE_FILE"
 touch "$HISTORY_FILE"
 
@@ -64,15 +62,16 @@ touch "$HISTORY_FILE"
 # ==========================================
 
 if [ ! -s "$STATE_FILE" ]; then
-
 cat > "$STATE_FILE" <<STATE
 ACCUMULATED=0
 LAST_TS=0
 LAST_AC=1
 CYCLE_DATE=""
 START_BATTERY=0
+IDLE_ACCUMULATED=0
+LAST_BATTERY=0
+SHUTDOWN_TS=0
 STATE
-
 fi
 
 source "$STATE_FILE"
@@ -82,6 +81,9 @@ LAST_TS=${LAST_TS:-0}
 LAST_AC=${LAST_AC:-1}
 CYCLE_DATE=${CYCLE_DATE:-""}
 START_BATTERY=${START_BATTERY:-0}
+IDLE_ACCUMULATED=${IDLE_ACCUMULATED:-0}
+LAST_BATTERY=${LAST_BATTERY:-0}
+SHUTDOWN_TS=${SHUTDOWN_TS:-0}
 
 save_state() {
     local tmp
@@ -92,24 +94,22 @@ LAST_TS=$LAST_TS
 LAST_AC=$LAST_AC
 CYCLE_DATE="$CYCLE_DATE"
 START_BATTERY=$START_BATTERY
+IDLE_ACCUMULATED=$IDLE_ACCUMULATED
+LAST_BATTERY=$LAST_BATTERY
+SHUTDOWN_TS=$SHUTDOWN_TS
 STATE
     mv -f "$tmp" "$STATE_FILE"
 }
 
-now_ts() {
-date +%s
-}
-
-format_date() {
-date '+%Y-%m-%d %H:%M:%S'
-}
+now_ts()     { date +%s; }
+format_date(){ date '+%Y-%m-%d %H:%M:%S'; }
 
 # ==========================================
 # AC Detection
 # ==========================================
 
 get_ac_status() {
-    # Ưu tiên Mains
+    # Priority: Mains
     for supply in /sys/class/power_supply/*; do
         [ -d "$supply" ] || continue
         local type
@@ -128,7 +128,7 @@ get_ac_status() {
             [ -f "$supply/online" ] && { cat "$supply/online"; return; }
         esac
     done
-    # Fallback: đọc trạng thái battery
+    # Fallback: battery status
     for bat in /sys/class/power_supply/BAT*; do
         [ -d "$bat" ] || continue
         local status
@@ -146,29 +146,32 @@ get_ac_status() {
 # ==========================================
 
 get_battery_percent() {
-
-for bat in /sys/class/power_supply/BAT*; do
-
-    if [ -f "$bat/capacity" ]; then
-        cat "$bat/capacity"
-        return
-    fi
-
-done
-
-echo 0
+    for bat in /sys/class/power_supply/BAT*; do
+        if [ -f "$bat/capacity" ]; then
+            cat "$bat/capacity"
+            return
+        fi
+    done
+    echo 0
 }
 
 # ==========================================
 # Restore State
 # ==========================================
 
+# If SHUTDOWN_TS is set, the daemon was stopped cleanly via ExecStop.
+# Calculate the gap between shutdown and now and add it to idle time.
+
+if [ "$SHUTDOWN_TS" -gt 0 ]; then
+    BOOT_GAP=$(( $(now_ts) - SHUTDOWN_TS ))
+    [ "$BOOT_GAP" -gt 0 ] && IDLE_ACCUMULATED=$((IDLE_ACCUMULATED + BOOT_GAP))
+    SHUTDOWN_TS=0
+fi
+
 CURRENT_AC=$(get_ac_status)
-
+LAST_BATTERY=$(get_battery_percent)
 LAST_TS=$(now_ts)
-
 LAST_AC="$CURRENT_AC"
-
 save_state
 
 # ==========================================
@@ -177,59 +180,108 @@ save_state
 
 while true; do
 
-CURRENT_AC=$(get_ac_status)
+    CURRENT_AC=$(get_ac_status)
+    NOW=$(now_ts)
+    DELTA=$((NOW - LAST_TS))
+    CURRENT_BATTERY=$(get_battery_percent)
 
-NOW=$(now_ts)
+    # ---- Suspend / hibernate / wake detection ----
+    # DELTA > 60 means the loop was frozen — system was suspended.
+    # Accumulate the gap as idle time.
+    # If battery increased during the gap, the charger was connected
+    # while sleeping → close session using pre-suspend battery as end value.
 
-DELTA=$((NOW - LAST_TS))
+    if [ "$DELTA" -gt 60 ]; then
 
-# Ignore suspend/reboot delta
+        IDLE_ACCUMULATED=$((IDLE_ACCUMULATED + DELTA))
 
-if [ "$DELTA" -gt 60 ]; then DELTA=0; fi
+        if [ "$LAST_AC" = "0" ] && \
+           [ "$CURRENT_BATTERY" -gt "$LAST_BATTERY" ] && \
+           [ "$ACCUMULATED" -gt 0 ] && \
+           [ -n "$CYCLE_DATE" ]; then
 
-# Plugged -> reset cycle
+            echo "$CYCLE_DATE|$ACCUMULATED|$START_BATTERY|$LAST_BATTERY|$IDLE_ACCUMULATED" \
+                >> "$HISTORY_FILE"
 
-if [ "$CURRENT_AC" = "1" ] && [ "$LAST_AC" = "0" ]; then
+            ACCUMULATED=0
+            IDLE_ACCUMULATED=0
+            CYCLE_DATE=""
+            START_BATTERY=0
+        fi
 
-    END_BATTERY=$(get_battery_percent)
-
-    if [ "$ACCUMULATED" -gt 0 ]; then
-
-        echo "$CYCLE_DATE|$ACCUMULATED|$START_BATTERY|$END_BATTERY" >> "$HISTORY_FILE"
-
+        DELTA=0
     fi
 
-    ACCUMULATED=0
-    CYCLE_DATE=""
-    START_BATTERY=0
-fi
+    # ---- Plugged in → end session ----
 
-# Unplugged
+    if [ "$CURRENT_AC" = "1" ] && [ "$LAST_AC" = "0" ]; then
 
-if [ "$CURRENT_AC" = "0" ]; then
+        if [ "$ACCUMULATED" -gt 0 ]; then
+            echo "$CYCLE_DATE|$ACCUMULATED|$START_BATTERY|$CURRENT_BATTERY|$IDLE_ACCUMULATED" \
+                >> "$HISTORY_FILE"
+        fi
 
-    if [ -z "$CYCLE_DATE" ]; then
-
-        CYCLE_DATE=$(format_date)
-
-        START_BATTERY=$(get_battery_percent)
-
+        ACCUMULATED=0
+        IDLE_ACCUMULATED=0
+        CYCLE_DATE=""
+        START_BATTERY=0
     fi
 
-    ACCUMULATED=$((ACCUMULATED + DELTA))
-fi
+    # ---- On battery → accumulate active time ----
 
-LAST_TS="$NOW"
-LAST_AC="$CURRENT_AC"
+    if [ "$CURRENT_AC" = "0" ]; then
 
-save_state
+        if [ -z "$CYCLE_DATE" ]; then
+            CYCLE_DATE=$(format_date)
+            START_BATTERY=$CURRENT_BATTERY
+        fi
 
-sleep 2
+        ACCUMULATED=$((ACCUMULATED + DELTA))
+    fi
+
+    LAST_BATTERY=$CURRENT_BATTERY
+    LAST_TS="$NOW"
+    LAST_AC="$CURRENT_AC"
+
+    save_state
+    sleep 2
 
 done
 EOF
 
 chmod +x "$BIN_DIR/onscreen-daemon.sh"
+
+# ==========================================
+# Flush script  (called by ExecStop)
+# Saves shutdown timestamp so the daemon can
+# calculate idle gap on next boot.
+# ==========================================
+
+cat > "$BIN_DIR/onscreen-flush.sh" <<'EOF'
+#!/usr/bin/env bash
+
+STATE_DIR="$HOME/.local/share/onscreen"
+STATE_FILE="$STATE_DIR/state"
+
+[ -f "$STATE_FILE" ] || exit 0
+
+source "$STATE_FILE"
+
+tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
+cat > "$tmp" <<STATE
+ACCUMULATED=${ACCUMULATED:-0}
+LAST_TS=${LAST_TS:-0}
+LAST_AC=${LAST_AC:-1}
+CYCLE_DATE="${CYCLE_DATE:-}"
+START_BATTERY=${START_BATTERY:-0}
+IDLE_ACCUMULATED=${IDLE_ACCUMULATED:-0}
+LAST_BATTERY=${LAST_BATTERY:-0}
+SHUTDOWN_TS=$(date +%s)
+STATE
+mv -f "$tmp" "$STATE_FILE"
+EOF
+
+chmod +x "$BIN_DIR/onscreen-flush.sh"
 
 # ==========================================
 # CLI
@@ -239,7 +291,6 @@ cat > "$BIN_DIR/onscreen" <<'EOF'
 #!/usr/bin/env bash
 
 STATE_DIR="$HOME/.local/share/onscreen"
-
 STATE_FILE="$STATE_DIR/state"
 HISTORY_FILE="$STATE_DIR/history"
 
@@ -255,7 +306,11 @@ LAST_TS=${LAST_TS:-0}
 LAST_AC=${LAST_AC:-1}
 CYCLE_DATE=${CYCLE_DATE:-""}
 START_BATTERY=${START_BATTERY:-0}
+IDLE_ACCUMULATED=${IDLE_ACCUMULATED:-0}
+LAST_BATTERY=${LAST_BATTERY:-0}
+SHUTDOWN_TS=${SHUTDOWN_TS:-0}
 
+# hh:mm:ss
 format_time() {
     local total_secs=$1
     local H=$((total_secs / 3600))
@@ -264,19 +319,27 @@ format_time() {
     printf "%02dh %02dm %02ds" "$H" "$M" "$S"
 }
 
-get_current_battery() {
-
-for bat in /sys/class/power_supply/BAT*; do
-
-    if [ -f "$bat/capacity" ]; then
-        cat "$bat/capacity"
-        return
-    fi
-
-done
-
-echo 0
+# hh:mm  (compact, for tables)
+format_time_hm() {
+    local total_secs=$1
+    local H=$((total_secs / 3600))
+    local M=$(((total_secs % 3600) / 60))
+    printf "%02dh %02dm" "$H" "$M"
 }
+
+get_current_battery() {
+    for bat in /sys/class/power_supply/BAT*; do
+        if [ -f "$bat/capacity" ]; then
+            cat "$bat/capacity"
+            return
+        fi
+    done
+    echo 0
+}
+
+# ==========================================
+# show_current  (--today / default)
+# ==========================================
 
 show_current() {
 
@@ -284,7 +347,6 @@ show_current() {
     local current_battery
     current_battery=$(get_current_battery)
 
-    # AC / Battery status
     if [ "${LAST_AC:-1}" = "1" ]; then
         echo "🔌 Charging — not tracking"
         echo "   Battery : ${current_battery}%"
@@ -293,20 +355,21 @@ show_current() {
 
     echo "🔋 On battery — tracking"
     echo "   Session  : $date_show"
-    echo "   Duration : $(format_time "$ACCUMULATED")"
+    echo "   Active   : $(format_time "$ACCUMULATED")"
+
+    if [ "${IDLE_ACCUMULATED:-0}" -gt 0 ]; then
+        echo "   Idle     : $(format_time "$IDLE_ACCUMULATED")  (sleep / suspend / shutdown)"
+    fi
+
     echo "   Battery  : ${START_BATTERY}% → ${current_battery}%"
 
-    # Cần ít nhất 60s và có drain thực sự để tính rate
     local drain=$((START_BATTERY - current_battery))
 
     if [ "$ACCUMULATED" -ge 60 ] && [ "$drain" -gt 0 ]; then
 
-        # Tránh floating point: nhân 10 trước rồi chia → 1 chữ số thập phân
         local rate_x10=$(( (drain * 36000) / ACCUMULATED ))
         local rate_int=$((rate_x10 / 10))
         local rate_dec=$((rate_x10 % 10))
-
-        # Thời gian còn lại (phút)
         local remaining_mins=$(( (current_battery * 600) / rate_x10 ))
         local r_h=$((remaining_mins / 60))
         local r_m=$((remaining_mins % 60))
@@ -321,40 +384,37 @@ show_current() {
     fi
 }
 
+# ==========================================
+# show_history  (--history)
+# ==========================================
+
 show_history() {
 
     local limit=${1:-10}
 
-    # ----------------------------------------
-    # Đọc N session gần nhất vào array
-    # ----------------------------------------
-
-    declare -a h_date h_secs h_start h_end
+    declare -a h_date h_secs h_start h_end h_idle
 
     if [ -f "$HISTORY_FILE" ] && [ -s "$HISTORY_FILE" ]; then
-
-        while IFS='|' read -r DATE TOTAL START_BAT END_BAT; do
+        while IFS='|' read -r DATE TOTAL START_BAT END_BAT IDLE; do
             h_date+=("$DATE")
             h_secs+=("$TOTAL")
             h_start+=("$START_BAT")
             h_end+=("$END_BAT")
+            h_idle+=("${IDLE:-0}")
         done < <(tail -n "$limit" "$HISTORY_FILE" | tac)
-
     fi
 
-    # ----------------------------------------
-    # Cộng session đang chạy vào đầu danh sách
-    # ----------------------------------------
-
+    # Prepend ongoing session
     local has_ongoing=0
     local current_bat
     current_bat=$(get_current_battery)
 
     if [ "${LAST_AC:-1}" = "0" ] && [ "$ACCUMULATED" -gt 0 ] && [ -n "$CYCLE_DATE" ]; then
         h_date=("$CYCLE_DATE" "${h_date[@]}")
-        h_secs=("$ACCUMULATED"  "${h_secs[@]}")
+        h_secs=("$ACCUMULATED" "${h_secs[@]}")
         h_start=("$START_BATTERY" "${h_start[@]}")
-        h_end=("$current_bat"   "${h_end[@]}")
+        h_end=("$current_bat" "${h_end[@]}")
+        h_idle=("${IDLE_ACCUMULATED:-0}" "${h_idle[@]}")
         has_ongoing=1
     fi
 
@@ -365,18 +425,10 @@ show_history() {
         return
     fi
 
-    # ----------------------------------------
-    # Tìm max để scale bar
-    # ----------------------------------------
-
     local max_secs=1
     for i in "${!h_secs[@]}"; do
         [ "${h_secs[$i]}" -gt "$max_secs" ] && max_secs="${h_secs[$i]}"
     done
-
-    # ----------------------------------------
-    # Render
-    # ----------------------------------------
 
     local BAR_WIDTH=20
 
@@ -390,17 +442,18 @@ show_history() {
 
     echo
     echo "  🗂   Session history  (last $count)"
-    echo "  $(printf '%.0s─' $(seq 1 70))"
-    printf "  %-18s  %-${BAR_WIDTH}s  %-14s  %-14s  %s\n" \
-        "Started" "Duration" "Time" "Battery" "Rate"
-    echo "  $(printf '%.0s─' $(seq 1 70))"
+    echo "  $(printf '%.0s─' $(seq 1 74))"
+    printf "  %-18s  %-${BAR_WIDTH}s  %-14s  %-18s  %-10s  %s\n" \
+        "Started" "Duration" "Active" "Battery" "Rate" "Idle"
+    echo "  $(printf '%.0s─' $(seq 1 74))"
 
     for i in "${!h_date[@]}"; do
 
         local secs=${h_secs[$i]}
         local start=${h_start[$i]}
         local end=${h_end[$i]}
-        local date_label tag drain rate_str
+        local idle=${h_idle[$i]:-0}
+        local date_label drain rate_str idle_str tag
 
         date_label=$(date -d "${h_date[$i]}" '+%a %d/%m %H:%M' 2>/dev/null \
                      || echo "${h_date[$i]}")
@@ -414,7 +467,6 @@ show_history() {
         local battery_str
         battery_str=$(printf "%3d%%→%3d%% (-%d%%)" "$start" "$end" "$drain")
 
-        # Rate %/hr — cần ít nhất 60s và drain > 0
         if [ "$secs" -ge 60 ] && [ "$drain" -gt 0 ]; then
             local rate_x10=$(( (drain * 36000) / secs ))
             rate_str=$(printf "%d.%d%%/hr" $((rate_x10/10)) $((rate_x10%10)))
@@ -424,27 +476,42 @@ show_history() {
             rate_str="~"
         fi
 
+        if [ "$idle" -gt 60 ]; then
+            idle_str=$(format_time_hm "$idle")
+        else
+            idle_str="—"
+        fi
+
         tag=""
         [ "$i" -eq 0 ] && [ "$has_ongoing" -eq 1 ] && tag="  🔋"
 
-        printf "  %-18s  %s  %-14s  %-18s  %s%s\n" \
+        printf "  %-18s  %s  %-14s  %-18s  %-10s  %s%s\n" \
             "$date_label" "$bar" "$(format_time "$secs")" \
-            "$battery_str" "$rate_str" "$tag"
-
+            "$battery_str" "$rate_str" "$idle_str" "$tag"
     done
 
-    echo "  $(printf '%.0s─' $(seq 1 70))"
+    echo "  $(printf '%.0s─' $(seq 1 74))"
 
-    # Tổng / trung bình
     local grand_total=0
-    for s in "${h_secs[@]}"; do grand_total=$((grand_total + s)); done
+    local grand_idle=0
+    for i in "${!h_secs[@]}"; do
+        grand_total=$((grand_total + h_secs[$i]))
+        grand_idle=$((grand_idle + ${h_idle[$i]:-0}))
+    done
 
     local avg_secs=$(( grand_total / count ))
+    local idle_footer=""
+    [ "$grand_idle" -gt 0 ] && idle_footer="  │  idle total: $(format_time_hm "$grand_idle")"
 
-    printf "  %-18s  %-${BAR_WIDTH}s  %-14s  avg %s/session\n" \
-        "$count sessions" "" "$(format_time "$grand_total")" "$(format_time "$avg_secs")"
+    printf "  %-18s  %-${BAR_WIDTH}s  %-14s  avg %s/session%s\n" \
+        "$count sessions" "" "$(format_time "$grand_total")" \
+        "$(format_time_hm "$avg_secs")" "$idle_footer"
     echo
 }
+
+# ==========================================
+# show_week  (--week / -w)
+# ==========================================
 
 show_week() {
 
@@ -452,96 +519,69 @@ show_week() {
     now=$(date +%s)
     week_ago=$((now - 604800))
 
-    declare -A day_secs day_bat_start day_bat_end day_ongoing
-
-    # ----------------------------------------
-    # Đọc history, group theo ngày
-    # ----------------------------------------
+    declare -A day_secs day_bat_start day_bat_end day_ongoing day_idle
 
     if [ -f "$HISTORY_FILE" ] && [ -s "$HISTORY_FILE" ]; then
-
-        while IFS='|' read -r DATE TOTAL START_BAT END_BAT; do
-
+        while IFS='|' read -r DATE TOTAL START_BAT END_BAT IDLE; do
             local ts day
             ts=$(date -d "$DATE" +%s 2>/dev/null || echo 0)
-
             [ "$ts" -lt "$week_ago" ] && continue
-
             day=$(date -d "$DATE" '+%Y-%m-%d')
-
             day_secs[$day]=$(( ${day_secs[$day]:-0} + TOTAL ))
-
-            # Giữ battery đầu session đầu tiên trong ngày, cuối session cuối cùng
+            day_idle[$day]=$(( ${day_idle[$day]:-0} + ${IDLE:-0} ))
             [ -z "${day_bat_start[$day]}" ] && day_bat_start[$day]=$START_BAT
             day_bat_end[$day]=$END_BAT
-
         done < "$HISTORY_FILE"
-
     fi
 
-    # ----------------------------------------
-    # Cộng session đang chạy (bug fix)
-    # ----------------------------------------
-
+    # Ongoing session
     local current_bat ongoing_day=""
     current_bat=$(get_current_battery)
 
     if [ "${LAST_AC:-1}" = "0" ] && [ "$ACCUMULATED" -gt 0 ] && [ -n "$CYCLE_DATE" ]; then
-
         local ts
         ts=$(date -d "$CYCLE_DATE" +%s 2>/dev/null || echo 0)
-
         if [ "$ts" -ge "$week_ago" ]; then
-
             ongoing_day=$(date '+%Y-%m-%d')
-
             day_secs[$ongoing_day]=$(( ${day_secs[$ongoing_day]:-0} + ACCUMULATED ))
-
+            day_idle[$ongoing_day]=$(( ${day_idle[$ongoing_day]:-0} + ${IDLE_ACCUMULATED:-0} ))
             [ -z "${day_bat_start[$ongoing_day]}" ] && day_bat_start[$ongoing_day]=$START_BATTERY
             day_bat_end[$ongoing_day]=$current_bat
             day_ongoing[$ongoing_day]=1
-
         fi
-
     fi
 
-    # ----------------------------------------
-    # Tìm max để scale bar
-    # ----------------------------------------
-
     local max_secs=1
-
     for d in "${!day_secs[@]}"; do
         [ "${day_secs[$d]}" -gt "$max_secs" ] && max_secs="${day_secs[$d]}"
     done
 
-    # ----------------------------------------
-    # Render
-    # ----------------------------------------
-
     local BAR_WIDTH=24
     local grand_total=0
+    local grand_idle=0
 
     make_bar() {
         local filled=$1 total=$2 bar=""
         local i
-        for ((i=0; i<filled; i++));        do bar+="█"; done
-        for ((i=filled; i<total; i++));    do bar+="░"; done
+        for ((i=0; i<filled; i++));     do bar+="█"; done
+        for ((i=filled; i<total; i++)); do bar+="░"; done
         echo "$bar"
     }
 
     echo
     echo "  📅  Last 7 days"
-    echo "  $(printf '%.0s─' $(seq 1 58))"
+    echo "  $(printf '%.0s─' $(seq 1 65))"
 
     for i in 6 5 4 3 2 1 0; do
 
-        local day label secs bar battery_info tag
+        local day label secs idle bar battery_info idle_str tag
         day=$(date -d "$i days ago" '+%Y-%m-%d')
         label=$(date -d "$day" '+%a %d/%m')
         secs=${day_secs[$day]:-0}
+        idle=${day_idle[$day]:-0}
 
         grand_total=$((grand_total + secs))
+        grand_idle=$((grand_idle + idle))
 
         if [ "$secs" -eq 0 ]; then
             printf "  %-9s  %s  —\n" "$label" "$(printf '%.0s ' $(seq 1 $BAR_WIDTH))"
@@ -555,42 +595,35 @@ show_week() {
         battery_info=""
         if [ -n "${day_bat_start[$day]}" ]; then
             local drain=$(( day_bat_start[$day] - day_bat_end[$day] ))
-            battery_info=$(printf "%3d%%→%3d%%  (-%d%%)" \
+            battery_info=$(printf "%3d%%→%3d%% (-%d%%)" \
                 "${day_bat_start[$day]}" "${day_bat_end[$day]}" "$drain")
         fi
 
+        idle_str=""
+        [ "$idle" -gt 60 ] && idle_str="  +$(format_time_hm "$idle") idle"
+
         tag=""
-        [ "${day_ongoing[$day]:-0}" = "1" ] && tag="  🔋 ongoing"
+        [ "${day_ongoing[$day]:-0}" = "1" ] && tag="  🔋"
 
-        printf "  %-9s  %s  %s  %s%s\n" \
-            "$label" "$bar" "$(format_time "$secs")" "$battery_info" "$tag"
-
+        printf "  %-9s  %s  %s  %-18s%s%s\n" \
+            "$label" "$bar" "$(format_time "$secs")" \
+            "$battery_info" "$idle_str" "$tag"
     done
 
-    echo "  $(printf '%.0s─' $(seq 1 58))"
-    printf "  %-9s  %s  %s\n" \
-        "Total" "$(printf '%.0s ' $(seq 1 $BAR_WIDTH))" "$(format_time "$grand_total")"
+    echo "  $(printf '%.0s─' $(seq 1 65))"
+
+    local idle_footer=""
+    [ "$grand_idle" -gt 0 ] && idle_footer="  │  idle: $(format_time_hm "$grand_idle")"
+
+    printf "  %-9s  %s  %s%s\n" \
+        "Total" "$(printf '%.0s ' $(seq 1 $BAR_WIDTH))" \
+        "$(format_time "$grand_total")" "$idle_footer"
     echo
 }
 
-# ----------------------------------------
-# Dùng nội bộ bởi --watch, không gọi trực tiếp
-# ----------------------------------------
-
-show_live() {
-    source "$STATE_FILE"
-    ACCUMULATED=${ACCUMULATED:-0}
-    LAST_TS=${LAST_TS:-0}
-    LAST_AC=${LAST_AC:-1}
-    CYCLE_DATE=${CYCLE_DATE:-""}
-    START_BATTERY=${START_BATTERY:-0}
-
-    show_current
-}
-
-# ----------------------------------------
-# watch wrapper
-# ----------------------------------------
+# ==========================================
+# show_watch  (--watch)
+# ==========================================
 
 show_watch() {
 
@@ -612,8 +645,12 @@ show_watch() {
     watch --color -n "$interval" -t "$self --live"
 }
 
+# ==========================================
+# Dispatch
+# ==========================================
 
 case "$1" in
+
     --live)
         source "$STATE_FILE"
         ACCUMULATED=${ACCUMULATED:-0}
@@ -621,11 +658,13 @@ case "$1" in
         LAST_AC=${LAST_AC:-1}
         CYCLE_DATE=${CYCLE_DATE:-""}
         START_BATTERY=${START_BATTERY:-0}
+        IDLE_ACCUMULATED=${IDLE_ACCUMULATED:-0}
+        LAST_BATTERY=${LAST_BATTERY:-0}
+        SHUTDOWN_TS=${SHUTDOWN_TS:-0}
         show_current
         ;;
 
     --watch*)
-        # Hỗ trợ: --watch, --watch 5, --watch=5
         interval=2
         if [[ "$1" =~ --watch=([0-9]+) ]]; then
             interval="${BASH_REMATCH[1]}"
@@ -672,6 +711,7 @@ Description=OnScreen Battery Usage Tracker
 
 [Service]
 ExecStart=%h/.local/bin/onscreen-daemon.sh
+ExecStop=%h/.local/bin/onscreen-flush.sh
 Restart=always
 RestartSec=3
 
@@ -708,13 +748,14 @@ echo "========================================"
 echo
 echo "Commands:"
 echo
-echo "onscreen"
-echo "onscreen --today"
-echo "onscreen --history"
-echo "onscreen --week"
-echo "onscreen --w"
+echo "  onscreen"
+echo "  onscreen --today"
+echo "  onscreen --watch"
+echo "  onscreen --watch=5"
+echo "  onscreen --history"
+echo "  onscreen --week  |  -w"
 echo
 echo "Restart terminal or run:"
 echo
-echo "source ~/.bashrc"
+echo "  source ~/.bashrc"
 echo
