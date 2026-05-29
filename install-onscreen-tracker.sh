@@ -9,6 +9,11 @@ echo "Installing $APP_NAME..."
 # ==========================================
 # Ubuntu/Debian Check
 # ==========================================
+# Add at start:
+if [ -z "$HOME" ]; then
+    echo "Error: HOME not set" >&2
+    exit 1
+fi
 
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -98,7 +103,7 @@ IDLE_ACCUMULATED=$IDLE_ACCUMULATED
 LAST_BATTERY=$LAST_BATTERY
 SHUTDOWN_TS=$SHUTDOWN_TS
 STATE
-    mv -f "$tmp" "$STATE_FILE"
+    mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 now_ts()     { date +%s; }
@@ -146,13 +151,15 @@ get_ac_status() {
 # ==========================================
 
 get_battery_percent() {
+    local max_cap=0
     for bat in /sys/class/power_supply/BAT*; do
         if [ -f "$bat/capacity" ]; then
-            cat "$bat/capacity"
-            return
+            local cap
+            cap=$(cat "$bat/capacity" 2>/dev/null) || continue
+            [ "$cap" -gt "$max_cap" ] && max_cap=$cap
         fi
     done
-    echo 0
+    echo "$max_cap"
 }
 
 # ==========================================
@@ -360,6 +367,7 @@ show_current() {
     if [ "${IDLE_ACCUMULATED:-0}" -gt 0 ]; then
         echo "   Idle     : $(format_time "$IDLE_ACCUMULATED")  (sleep / suspend / shutdown)"
     fi
+    echo "   Total    : $(format_time $(( ACCUMULATED + IDLE_ACCUMULATED )))"
 
     echo "   Battery  : ${START_BATTERY}% → ${current_battery}%"
 
@@ -443,8 +451,8 @@ show_history() {
     echo
     echo "  🗂   Session history  (last $count)"
     echo "  $(printf '%.0s─' $(seq 1 74))"
-    printf "  %-18s  %-${BAR_WIDTH}s  %-14s  %-18s  %-10s  %s\n" \
-        "Started" "Duration" "Active" "Battery" "Rate" "Idle"
+    printf "  %-18s  %-${BAR_WIDTH}s  %-25s  %-18s  %-10s  %s\n" \
+        "Started" "Duration" "Active / Total" "Battery" "Rate" "Idle"
     echo "  $(printf '%.0s─' $(seq 1 74))"
 
     for i in "${!h_date[@]}"; do
@@ -454,7 +462,6 @@ show_history() {
         local end=${h_end[$i]}
         local idle=${h_idle[$i]:-0}
         local date_label drain rate_str idle_str tag
-
         date_label=$(date -d "${h_date[$i]}" '+%a %d/%m %H:%M' 2>/dev/null \
                      || echo "${h_date[$i]}")
 
@@ -484,10 +491,17 @@ show_history() {
 
         tag=""
         [ "$i" -eq 0 ] && [ "$has_ongoing" -eq 1 ] && tag="  🔋"
-
-        printf "  %-18s  %s  %-14s  %-18s  %-10s  %s%s\n" \
-            "$date_label" "$bar" "$(format_time "$secs")" \
-            "$battery_str" "$rate_str" "$idle_str" "$tag"
+        
+        local total_secs=$(( secs + idle ))
+        local time_str
+        if [ "$idle" -gt 60 ]; then
+            time_str="$(format_time "$secs") / $(format_time "$total_secs")"
+        else
+            time_str="$(format_time "$secs")"
+        fi
+        printf "  %-18s  %s  %-25s  %-18s  %-10s  %s%s\n" \
+        "$date_label" "$bar" "$time_str" \
+        "$battery_str" "$rate_str" "$idle_str" "$tag"
     done
 
     echo "  $(printf '%.0s─' $(seq 1 74))"
@@ -605,9 +619,16 @@ show_week() {
         tag=""
         [ "${day_ongoing[$day]:-0}" = "1" ] && tag="  🔋"
 
-        printf "  %-9s  %s  %s  %-18s%s%s\n" \
-            "$label" "$bar" "$(format_time "$secs")" \
-            "$battery_info" "$idle_str" "$tag"
+        local total_day=$(( secs + idle ))
+        local time_str
+        if [ "$idle" -gt 60 ]; then
+            time_str="$(format_time "$secs") / $(format_time "$total_day")"
+        else
+            time_str="$(format_time "$secs")"
+        fi
+
+        printf "  %-9s  %s  %-25s  %-18s%s\n" \
+            "$label" "$bar" "$time_str" "$battery_info" "$tag"
     done
 
     echo "  $(printf '%.0s─' $(seq 1 65))"
@@ -615,9 +636,14 @@ show_week() {
     local idle_footer=""
     [ "$grand_idle" -gt 0 ] && idle_footer="  │  idle: $(format_time_hm "$grand_idle")"
 
-    printf "  %-9s  %s  %s%s\n" \
+    local grand_total_wall=$(( grand_total + grand_idle ))
+    local wall_footer=""
+    [ "$grand_idle" -gt 0 ] && \
+        wall_footer=" / $(format_time "$grand_total_wall") wall"
+
+    printf "  %-9s  %s  %s%s%s\n" \
         "Total" "$(printf '%.0s ' $(seq 1 $BAR_WIDTH))" \
-        "$(format_time "$grand_total")" "$idle_footer"
+        "$(format_time "$grand_total")" "$wall_footer" "$idle_footer"
     echo
 }
 
@@ -712,8 +738,12 @@ Description=OnScreen Battery Usage Tracker
 [Service]
 ExecStart=%h/.local/bin/onscreen-daemon.sh
 ExecStop=%h/.local/bin/onscreen-flush.sh
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartForceExitStatus=1
+RestartMaxDelaySec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=onscreen
 
 [Install]
 WantedBy=default.target
@@ -723,9 +753,10 @@ EOF
 # PATH
 # ==========================================
 
-if ! grep -q '.local/bin' "$HOME/.bashrc"; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-fi
+for shell_rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$shell_rc" ] && grep -q '.local/bin' "$shell_rc" || \
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_rc" 2>/dev/null || true
+done
 
 # ==========================================
 # Reset old state
