@@ -14,6 +14,7 @@ Kho lưu trữ này cung cấp bộ công cụ Shell Script (`.sh`) giúp tự �
 | **Tích hợp Zalo** | `install-zalo.sh`<br>`remove-zalo.sh` | `sudo` | `/opt/zalo/`, `Desktop Shortcuts` |
 | **Chẩn đoán Hệ thống** | `system-report.sh` | `user` / `sudo` | Tối ưu Kernel, Boot-time, Log UI |
 | **Tối ưu & Khôi phục Ubuntu** | `ubuntu-debloat.sh`<br>`ubuntu-restore.sh` | `sudo` | Gỡ bỏ/trả lại package và dịch vụ Canonical |
+| **Khởi tạo Webserver Docker** | `init-webserver-docker.sh` | `sudo` | Docker, MySQL, Nginx, Certbot, net-tools |
 | **Tài liệu Tham khảo** | `Ubuntu-Optimize-On-Thinkpad.xlsx` | `user` | Hướng dẫn tối ưu Ubuntu cho ThinkPad |
 
 ---
@@ -96,6 +97,27 @@ Loại bỏ các package và dịch vụ Canonical không cần thiết, rồi k
   ```bash
   sudo ./ubuntu-restore.sh
   ```
+
+### 7. Khởi tạo Webserver Docker (`init-webserver-docker.sh`)
+Thiết lập một máy chủ Ubuntu chuẩn với Docker, MySQL, Nginx, Certbot và net-tools.
+
+* **Cài đặt toàn bộ stack:**
+  ```bash
+  sudo ./init-webserver-docker.sh
+  ```
+* **Điểm chính:**
+  - Cập nhật hệ thống và cài đặt các thư viện cần thiết
+  - Cài Docker Engine, Docker Compose plugin và containerd
+  - Cài MySQL Server và MySQL Client
+  - Cài Nginx và khởi động dịch vụ
+  - Cài Certbot với plugin Nginx để cấp chứng chỉ SSL
+  - Cài net-tools để hỗ trợ kiểm tra mạng
+
+* **Lời khuyên sau khi chạy xong:**
+  1. `sudo mysql_secure_installation`
+  2. `sudo ufw allow OpenSSH`
+  3. `sudo ufw allow 'Nginx Full'`
+  4. `sudo certbot --nginx -d example.com`
 
 ---
 
