@@ -12,6 +12,7 @@ Kho lưu trữ này cung cấp bộ công cụ Shell Script (`.sh`) giúp tự �
 | **Quản lý Nguồn điện** | `install-auto-power-profile.sh` | `sudo` | `/etc/udev/rules.d/`, `systemd` |
 | **Giám sát Màn hình** | `install-onscreen-tracker.sh`<br>`uninstall-onscreen-tracker.sh` | `user` | `$HOME/.local/share/onscreen/` |
 | **Tích hợp Zalo** | `install-zalo.sh`<br>`remove-zalo.sh` | `sudo` | `/opt/zalo/`, `Desktop Shortcuts` |
+| **Bộ gõ Tiếng Việt Lotus** | `bazzite_install_lotus_1.sh`<br>`bazzite_install_lotus_2.sh` | `sudo` | `fcitx5`, `fcitx5-lotus`, `systemd` |
 | **Chẩn đoán Hệ thống** | `system-report.sh` | `user` / `sudo` | Tối ưu Kernel, Boot-time, Log UI |
 | **Tối ưu & Khôi phục Ubuntu** | `ubuntu-debloat.sh`<br>`ubuntu-restore.sh` | `sudo` | Gỡ bỏ/trả lại package và dịch vụ Canonical |
 | **Khởi tạo Webserver Docker** | `init-webserver-docker.sh` | `sudo` | Docker, MySQL, Nginx, Certbot, net-tools |
@@ -78,7 +79,31 @@ Tự động tải bản build Zalo AppImage (tích hợp ZaDark) từ cộng đ
   sudo ./remove-zalo.sh
   ```
 
-### 5. Chẩn đoán & Tinh chỉnh Hệ thống (`system-report.sh`)
+### 5. Cấu hình môi trường & cài đặt thư viện nền Lotus (`bazzite_install_lotus_1.sh`)
+Script này tự động cấu hình biến môi trường Fcitx5 cho shell hiện tại, thiết lập autostart và cài đặt các gói phụ thuộc cần thiết qua `rpm-ostree`.
+
+* **Cài đặt:**
+  ```bash
+  sudo ./bazzite_install_lotus_1.sh
+  ```
+* **Lưu ý:**
+  - Script sử dụng `rpm-ostree` để cài `fcitx5`, `fcitx5-configtool`, `fcitx5-gtk`, `fcitx5-qt` và các thư viện phát triển.
+  - Sau khi chạy xong, khởi động lại hệ thống để các biến môi trường và autostart có hiệu lực.
+
+### 6. Cài đặt bộ gõ Tiếng Việt Lotus trên Bazzite Linux (`bazzite_install_lotus_2.sh`)
+Script này clone mã nguồn `fcitx5-lotus`, biên dịch và cài đặt lên hệ thống, sau đó kích hoạt dịch vụ `fcitx5-lotus-server` cho người dùng hiện tại.
+
+* **Cài đặt:**
+  ```bash
+  sudo ./bazzite_install_lotus_2.sh
+  ```
+* **Sau khi cài xong:**
+  1. Mở ứng dụng `Fcitx5 Configuration`.
+  2. Tìm `Lotus` trong phần `Available Input Method`.
+  3. Nhấn nút `<' để chuyển `Lotus` sang phần `Input Method` đang sử dụng.
+  4. Nhấn `Apply/OK` để lưu cấu hình.
+
+### 7. Chẩn đoán & Tinh chỉnh Hệ thống (`system-report.sh`)
 Kiểm tra sức khỏe hệ thống: Phân tích xung đột các daemon nguồn (TLP, thermald), cấu hình Ram/Swap (`swappiness`), hiển thị Top 10 dịch vụ làm chậm quá trình khởi động máy, thông số Kernel limits và check log lỗi giao diện GNOME/Wayland.
 
 * **Sử dụng:**
